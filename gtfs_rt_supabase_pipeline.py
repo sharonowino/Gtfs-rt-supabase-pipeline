@@ -451,12 +451,19 @@ def _sanitize_for_json(obj):
     """Recursively make a value JSON-serialisable."""
     if obj is None:
         return None
-    if isinstance(obj, float) and math.isnan(obj):
-        return None
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return None
+        # Convert whole-number floats (185.0) to int so Postgres INTEGER accepts them
+        if obj == int(obj):
+            return int(obj)
+        return obj
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
-        return None if math.isnan(float(obj)) else float(obj)
+        return None if math.isnan(float(obj)) else (
+            int(float(obj)) if float(obj) == int(float(obj)) else float(obj)
+        )
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     if isinstance(obj, (pd.Timestamp, datetime)):
@@ -506,69 +513,7 @@ def upsert_to_supabase(
 
     return total
 
-
-
-# 5.  MAIN PIPELINE LOOP
-
-
-def run_pipeline(
-    run_duration: timedelta = RUN_DURATION,
-    poll_interval: int = POLL_INTERVAL_SECONDS,
-) -> None:
-    """
-    Poll all three GTFS-RT feeds every `poll_interval` seconds for
-    `run_duration`, parsing each response and upserting into Supabase.
-    """
-    client      = get_supabase_client()
-    stop_time   = datetime.now() + run_duration
-    cycle       = 0
-
-    log.info("Pipeline started. Will run until %s", stop_time.strftime("%Y-%m-%d %H:%M:%S"))
-    log.info("Poll interval: %d s  |  Tables: vehicle_positions, service_alerts, trip_updates", poll_interval)
-
-    while datetime.now() < stop_time:
-        cycle += 1
-        log.info("── Cycle %d ──────────────────────────────────────", cycle)
-
-        feeds = fetch_all_feeds()
-
-        # ── Vehicle Positions ─────────────────────────────────────────────────
-        if feeds.get("vehicle_positions"):
-            vp_df = parse_vehicle_positions(feeds["vehicle_positions"])
-            upsert_to_supabase(
-                client, "vehicle_positions", vp_df,
-                conflict_columns=["entity_id", "timestamp"]
-            )
-
-        # ── Service Alerts ────────────────────────────────────────────────────
-        if feeds.get("alerts"):
-            al_df = parse_alerts(feeds["alerts"])
-            upsert_to_supabase(
-                client, "service_alerts", al_df,
-                conflict_columns=["alert_id", "feed_timestamp", "informed_route_id", "informed_stop_id"]
-            )
-
-        # ── Trip Updates ──────────────────────────────────────────────────────
-        if feeds.get("trip_updates"):
-            tu_df = parse_trip_updates(feeds["trip_updates"])
-            upsert_to_supabase(
-                client, "trip_updates", tu_df,
-                conflict_columns=["entity_id", "stop_sequence", "arrival_time", "departure_time"]
-            )
-
-        # ── sleep until next cycle ────────────────────────────────────────────
-        remaining = (stop_time - datetime.now()).total_seconds()
-        sleep_for = min(poll_interval, remaining)
-        if sleep_for > 0:
-            log.info("Sleeping for %.0f s …", sleep_for)
-            time.sleep(sleep_for)
-
-    log.info("Pipeline finished after %d cycles.", cycle)
-
-# GitHub Actions
-
 def run_once():
-    """Fetch all feeds once and upsert. Called by GitHub Actions."""
     client = get_supabase_client()
     feeds  = fetch_all_feeds()
 
@@ -581,18 +526,14 @@ def run_once():
         al_df = parse_alerts(feeds["alerts"])
         upsert_to_supabase(client, "service_alerts", al_df,
                            conflict_columns=["alert_id", "feed_timestamp",
-                                            "informed_route_id", "informed_stop_id"])
+                                             "informed_route_id", "informed_stop_id"])
 
     if feeds.get("trip_updates"):
         tu_df = parse_trip_updates(feeds["trip_updates"])
         upsert_to_supabase(client, "trip_updates", tu_df,
                            conflict_columns=["entity_id", "stop_sequence",
-                                            "arrival_time", "departure_time"])
-
+                                             "arrival_time", "departure_time"])
     log.info("Single run complete.")
 
-
-# 6.  ENTRY POINT
-
 if __name__ == "__main__":
-    run_once()   # ← change this from run_pipeline() to run_once()
+    run_once()
